@@ -42,6 +42,7 @@ module ibex_cs_registers #(
 
     // mtvec
     output logic [31:0]          csr_mtvec_o,
+    output logic [31:0]          csr_mtvecx_o,
     input  logic                 csr_mtvec_init_i,
     input  logic [31:0]          boot_addr_i,
 
@@ -58,9 +59,11 @@ module ibex_cs_registers #(
     input  logic                 irq_timer_i,
     input  logic                 irq_external_i,
     input  logic [14:0]          irq_fast_i,
+    input  logic [31:0]          irq_x_i,
     input  logic                 nmi_mode_i,
     output logic                 irq_pending_o,          // interrupt request pending
     output ibex_pkg::irqs_t      irqs_o,                 // interrupt requests qualified with mie
+    output logic [31:0]          irqs_x_o,               // custom interrupt request qualified with miex
     output logic                 csr_mstatus_mie_o,
     output logic [31:0]          csr_mepc_o,
 
@@ -206,6 +209,14 @@ module ibex_cs_registers #(
   logic [31:0] dscratch1_q;
   logic        dscratch0_en, dscratch1_en;
 
+  // CLINTx
+  logic [31:0] miex_q;
+  logic        miex_en;
+  logic [31:0] mipx;
+  logic [31:0] mtvecx_q, mtvecx_d;
+  logic        mtvecx_err;
+  logic        mtvecx_en;
+
   // CSRs for recoverable NMIs
   // NOTE: these CSRS are nonstandard, see https://github.com/riscv/riscv-isa-manual/issues/261
   status_stk_t mstack_q, mstack_d;
@@ -282,6 +293,9 @@ module ibex_cs_registers #(
   assign mip.irq_timer    = irq_timer_i;
   assign mip.irq_external = irq_external_i;
   assign mip.irq_fast     = irq_fast_i;
+
+  // mipx CSR is purely combinational - must be able to re-enable the clock upon WFI
+  assign mipx = irq_x_i;
 
   // read logic
   always_comb begin
@@ -455,6 +469,11 @@ module ibex_cs_registers #(
         csr_rdata_int = '0;
       end
 
+      // CLINTx
+      CSR_MIEX:   csr_rdata_int = miex_q;
+      CSR_MIPX:   csr_rdata_int = mipx;
+      CSR_MTVECX: csr_rdata_int = mtvecx_q;
+
       default: begin
         illegal_csr = 1'b1;
       end
@@ -497,6 +516,13 @@ module ibex_cs_registers #(
     mcountinhibit_we = 1'b0;
     mhpmcounter_we   = '0;
     mhpmcounterh_we  = '0;
+
+    miex_en          = 1'b0;
+    mtvecx_en         = csr_mtvec_init_i;
+    // mtvecx.MODE set to vectored
+    // mtvecx.BASE must be 256-byte aligned
+    mtvecx_d         = csr_mtvec_init_i ? {boot_addr_i[31:8], 6'b0, 2'b01} : 
+                                          {csr_wdata_int[31:8], 6'b0, 2'b01};
 
     cpuctrl_we       = 1'b0;
 
@@ -595,6 +621,10 @@ module ibex_cs_registers #(
         end
 
         CSR_CPUCTRL: cpuctrl_we = 1'b1;
+
+        // CLINTx
+        CSR_MIEX: miex_en = 1'b1;
+        CSR_MTVECX: mtvecx_en = 1'b1;
 
         default:;
       endcase
@@ -727,7 +757,14 @@ module ibex_cs_registers #(
   // Qualify incoming interrupt requests in mip CSR with mie CSR for controller and to re-enable
   // clock upon WFI (must be purely combinational).
   assign irqs_o        = mip & mie_q;
-  assign irq_pending_o = |irqs_o;
+  assign irq_pending_o = (|irqs_o) | (|irqs_x_o);
+
+  // Qualify incoming interrupt requests in mipx CSR with miex CSR for controller and to re-enable
+  // clock upon WFI (must be purely combinational).
+  assign irqs_x_o      = mipx & miex_q;
+
+  // directly output mtvecx to IF stage
+  assign csr_mtvecx_o  = mtvecx_q;
 
   ////////////////////////
   // CSR instantiations //
@@ -946,6 +983,34 @@ module ibex_cs_registers #(
     .wr_en_i    (mstack_en),
     .rd_data_o  (mstack_cause_q),
     .rd_error_o ()
+  );
+
+  // MIEX
+  ibex_csr #(
+    .Width      (32),
+    .ShadowCopy (1'b0),
+    .ResetValue ({32{1'b1}})
+  ) u_miex_csr (
+    .clk_i      (clk_i),
+    .rst_ni     (rst_ni),
+    .wr_data_i  (csr_wdata_int),
+    .wr_en_i    (miex_en),
+    .rd_data_o  (miex_q),
+    .rd_error_o ()
+  );
+
+  // MTVECX
+  ibex_csr #(
+    .Width      (32),
+    .ShadowCopy (ShadowCSR),
+    .ResetValue (32'b01)
+  ) u_mtvecx_csr (
+    .clk_i      (clk_i),
+    .rst_ni     (rst_ni),
+    .wr_data_i  (mtvecx_d),
+    .wr_en_i    (mtvecx_en),
+    .rd_data_o  (mtvecx_q),
+    .rd_error_o (mtvecx_err)
   );
 
   // -----------------
@@ -1409,7 +1474,7 @@ module ibex_cs_registers #(
     .rd_error_o (cpuctrl_err)
   );
 
-  assign csr_shadow_err_o = mstatus_err | mtvec_err | pmp_csr_err | cpuctrl_err;
+  assign csr_shadow_err_o = mstatus_err | mtvec_err | mtvecx_err | pmp_csr_err | cpuctrl_err;
 
   ////////////////
   // Assertions //
